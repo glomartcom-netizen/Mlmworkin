@@ -1,0 +1,1035 @@
+require("dotenv").config();  
+const express = require("express");  
+const mysql = require("mysql2/promise");  
+const cors = require("cors");  
+  
+const app = express();  
+app.use(cors());  
+app.use(express.json());  
+  
+// ==========================================  
+// 🔥 DB  
+// ==========================================  
+const pool = mysql.createPool({  
+  host: "localhost",  
+  user: "root",  
+  password: "your_password",  
+  database: "dimex_db",  
+  connectionLimit: 10  
+});  
+  
+// ==========================================  
+// ⚙️ CONFIG  
+// ==========================================  
+const MAX_CYCLES = 3;  
+const DIRECT_PERCENT = 0.05;  
+const BINARY_PERCENT = 0.05;  
+  
+// ==========================================  
+// 🔥 CRYPTO SETUP  
+// ==========================================  
+const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));  
+const { ethers } = require("ethers");  
+const TronWeb = require("tronweb");  
+  
+// BSC  
+const bscProvider = new ethers.JsonRpcProvider("https://bsc-dataseed.binance.org/");  
+const bscWallet = new ethers.Wallet(process.env.BSC_PRIVATE_KEY, bscProvider);  
+  
+const BEP20 = new ethers.Contract(  
+  "0x55d398326f99059fF775485246999027B3197955",  
+  ["function transfer(address to, uint amount) public returns (bool)"],  
+  bscWallet  
+);  
+  
+// TRON  
+const tronWeb = new TronWeb({  
+  fullHost: "https://api.trongrid.io",  
+  privateKey: process.env.TRON_PRIVATE_KEY  
+});  
+  
+// ==========================================  
+// 💰 WALLET FUNCTION  
+// ==========================================  
+async function wallet(userId, amount, type){  
+  
+  if(type==="CREDIT"){  
+    await pool.query(  
+      "UPDATE Wallets SET balance = balance + ? WHERE user_id=?",  
+      [amount, userId]  
+    );  
+  }else{  
+    const [r] = await pool.query(  
+      "UPDATE Wallets SET balance = balance - ? WHERE user_id=? AND balance>=?",  
+      [amount, userId, amount]  
+    );  
+    if(r.affectedRows === 0) throw new Error("Insufficient balance");  
+  }  
+}  
+  
+// ==========================================  
+// 🔥 VERIFY TRANSACTION  
+// ==========================================  
+async function verifyTransaction(tx_hash, network, amount){  
+  
+  try{  
+  
+    if(network === "BEP20"){  
+      const res = await fetch(  
+        `https://api.bscscan.com/api?module=proxy&action=eth_getTransactionByHash&txhash=${tx_hash}`  
+      ).then(r=>r.json());  
+  
+      if(!res.result) return false;  
+  
+      const value = parseInt(res.result.value,16) / 1e18;  
+  
+      return value >= amount;  
+    }  
+  
+    if(network === "TRC20"){  
+      const res = await fetch(  
+        `https://api.trongrid.io/v1/transactions/${tx_hash}`  
+      ).then(r=>r.json());  
+  
+      return res.data && res.data.length;  
+    }  
+  
+  }catch(e){  
+    console.log(e);  
+  }  
+  
+  return false;  
+}  
+  
+// ==========================================  
+// 👤 REGISTER  
+// ==========================================  
+app.post("/api/register", async (req,res)=>{  
+  
+  const { name, mobile, sponsor, position, wallet_address } = req.body;  
+  
+  const member_id = "DMX" + Math.floor(100000 + Math.random()*900000);  
+  
+  const [r] = await pool.query(  
+    "INSERT INTO Users (member_id, full_name, mobile, sponsor_id, position, wallet_address, cycles) VALUES (?,?,?,?,?,?,0)",  
+    [member_id, name, mobile, sponsor, position, wallet_address]  
+  );  
+  
+  await pool.query(  
+    "INSERT INTO Wallets (user_id, balance) VALUES (?,0)",  
+    [r.insertId]  
+  );  
+  
+  res.json({  
+    member_id,  
+    referral_left: `?ref=${member_id}&pos=LEFT`,  
+    referral_right: `?ref=${member_id}&pos=RIGHT`  
+  });  
+});  
+  
+// ==========================================  
+// 🔥 CRYPTO DEPOSIT (AUTO)  
+// ==========================================  
+app.post("/api/user/deposit-crypto", async (req,res)=>{  
+  
+  const { member_id, tx_hash, network, amount } = req.body;  
+  
+  const [dup] = await pool.query(  
+    "SELECT id FROM Deposits WHERE tx_hash=?",  
+    [tx_hash]  
+  );  
+  
+  if(dup.length) return res.json({msg:"TX already used"});  
+  
+  const valid = await verifyTransaction(tx_hash, network, amount);  
+  if(!valid) return res.json({msg:"Invalid TX"});  
+  
+  const [u] = await pool.query(  
+    "SELECT * FROM Users WHERE member_id=?",  
+    [member_id]  
+  );  
+  
+  const user = u[0];  
+  
+  await pool.query(  
+    "INSERT INTO Deposits (user_id, amount, tx_hash, network, status) VALUES (?, ?, ?, ?, 'APPROVED')",  
+    [user.id, amount, tx_hash, network]  
+  );  
+  
+  await pool.query(  
+    "UPDATE Users SET total_deposit = total_deposit + ? WHERE id=?",  
+    [amount, user.id]  
+  );  
+  
+  // DIRECT  
+  if(user.sponsor_id){  
+    const [sp] = await pool.query(  
+      "SELECT id FROM Users WHERE member_id=?",  
+      [user.sponsor_id]  
+    );  
+  
+    if(sp.length){  
+      const bonus = amount * DIRECT_PERCENT;  
+      await wallet(sp[0].id, bonus, "CREDIT");  
+  
+      await pool.query(  
+        "INSERT INTO Income (user_id,type,amount) VALUES (?, 'DIRECT', ?)",  
+        [sp[0].id, bonus]  
+      );  
+    }  
+  }  
+  
+  await updateBinary(user.sponsor_id, amount, user.position);  
+  
+  res.json({success:true});  
+});  
+  
+// ==========================================  
+// 🔥 BINARY UPDATE  
+// ==========================================  
+async function updateBinary(member_id, amount, position){  
+  
+  if(!member_id) return;  
+  
+  if(position==="LEFT"){  
+    await pool.query(  
+      "UPDATE Users SET left_volume = left_volume + ? WHERE member_id=?",  
+      [amount, member_id]  
+    );  
+  }else{  
+    await pool.query(  
+      "UPDATE Users SET right_volume = right_volume + ? WHERE member_id=?",  
+      [amount, member_id]  
+    );  
+  }  
+  
+  await checkMatching(member_id);  
+}  
+  
+// ==========================================  
+// 🔥 WORKING PLAN + BINARY MATCH  
+// ==========================================  
+async function checkMatching(member_id){  
+  
+  const [u] = await pool.query(  
+    "SELECT * FROM Users WHERE member_id=?",  
+    [member_id]  
+  );  
+  
+  const user = u[0];  
+  
+  if(user.cycles >= MAX_CYCLES) return;  
+  
+  const required = user.total_deposit;  
+  
+  if(user.left_volume >= required && user.right_volume >= required){  
+  
+    // 🔥 WORKING INCOME  
+    await wallet(user.id, user.total_deposit, "CREDIT");  
+  
+    await pool.query(  
+      "INSERT INTO Income (user_id,type,amount) VALUES (?, 'WORKING', ?)",  
+      [user.id, user.total_deposit]  
+    );  
+  
+    // 🔥 BINARY BONUS  
+    const binary = user.total_deposit * BINARY_PERCENT;  
+  
+    await wallet(user.id, binary, "CREDIT");  
+  
+    await pool.query(  
+      "INSERT INTO Income (user_id,type,amount) VALUES (?, 'BINARY', ?)",  
+      [user.id, binary]  
+    );  
+  
+    // cycle  
+    await pool.query(  
+      "UPDATE Users SET cycles = cycles + 1 WHERE id=?",  
+      [user.id]  
+    );  
+  
+    // flush  
+    await pool.query(  
+      "UPDATE Users SET left_volume=left_volume-?, right_volume=right_volume-? WHERE id=?",  
+      [required, required, user.id]  
+    );  
+  }  
+}  
+  
+// ==========================================  
+// 💸 WITHDRAW (AUTO CRYPTO)  
+// ==========================================  
+app.post("/api/user/withdraw", async (req,res)=>{  
+  
+  const { member_id, amount, wallet_address, network } = req.body;  
+  
+  const [u] = await pool.query(  
+    "SELECT id FROM Users WHERE member_id=?",  
+    [member_id]  
+  );  
+  
+  const userId = u[0].id;  
+  
+  const [w] = await pool.query(  
+    "SELECT balance FROM Wallets WHERE user_id=?",  
+    [userId]  
+  );  
+  
+  if(!w.length || w[0].balance < amount){  
+    return res.json({msg:"Insufficient balance"});  
+  }  
+  
+  await wallet(userId, amount, "DEBIT");  
+  
+  let txHash = "";  
+  
+  try{  
+  
+    if(network === "BEP20"){  
+      const tx = await BEP20.transfer(  
+        wallet_address,  
+        ethers.parseUnits(amount.toString(), 18)  
+      );  
+      txHash = tx.hash;  
+    }  
+  
+    if(network === "TRC20"){  
+      const contract = await tronWeb.contract().at("TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj");  
+  
+      const tx = await contract.transfer(  
+        wallet_address,  
+        amount * 1e6  
+      ).send();  
+  
+      txHash = tx;  
+    }  
+  
+  }catch(e){  
+    await wallet(userId, amount, "CREDIT");  
+    return res.json({msg:"Withdraw failed"});  
+  }  
+  
+  await pool.query(  
+    "INSERT INTO Withdrawals (user_id, amount, tx_hash, network, status) VALUES (?, ?, ?, ?, 'PAID')",  
+    [userId, amount, txHash, network]  
+  );  
+  
+  res.json({success:true, txHash});  
+});  
+  
+// ==========================================  
+// 📊 ADMIN - MAIN STATS  
+// ==========================================  
+app.get("/api/admin/stats", async (req,res)=>{  
+  
+  const [users] = await pool.query("SELECT COUNT(*) as t FROM Users");  
+  const [dep] = await pool.query("SELECT SUM(amount) as t FROM Deposits");  
+  const [wd] = await pool.query("SELECT SUM(amount) as t FROM Withdrawals");  
+  const [wallet] = await pool.query("SELECT SUM(balance) as t FROM Wallets");  
+  
+  res.json({  
+    users: users[0].t || 0,  
+    deposit: dep[0].t || 0,  
+    withdraw: wd[0].t || 0,  
+    balance: wallet[0].t || 0  
+  });  
+});  
+  
+// ==========================================  
+// 👥 SIMPLE USERS LIST  
+// ==========================================  
+app.get("/api/admin/users", async (req,res)=>{  
+  const [rows] = await pool.query(`  
+    SELECT member_id, full_name, mobile, sponsor_id, total_deposit, status  
+    FROM Users ORDER BY id DESC  
+  `);  
+  res.json(rows);  
+});  
+  
+// ==========================================  
+// 💰 DEPOSITS LIST  
+// ==========================================  
+app.get("/api/admin/deposits", async (req,res)=>{  
+  const [rows] = await pool.query(`  
+    SELECT d.*, u.member_id   
+    FROM Deposits d  
+    JOIN Users u ON d.user_id = u.id  
+    ORDER BY d.id DESC  
+  `);  
+  res.json(rows);  
+});  
+  
+// ==========================================  
+// 💸 WITHDRAWALS LIST  
+// ==========================================  
+app.get("/api/admin/withdrawals", async (req,res)=>{  
+  const [rows] = await pool.query(`  
+    SELECT w.*, u.member_id   
+    FROM Withdrawals w  
+    JOIN Users u ON w.user_id = u.id  
+    ORDER BY w.id DESC  
+  `);  
+  res.json(rows);  
+});  
+  
+// ==========================================  
+// 👑 FULL MEMBER LIST (ADVANCED)  
+// ==========================================  
+app.get("/api/admin/members-full", async (req,res)=>{  
+  
+  const [rows] = await pool.query(`  
+    SELECT   
+      u.id,  
+      u.member_id,  
+      u.full_name,  
+      u.mobile,  
+      u.email,  
+      u.sponsor_id,  
+      u.position,  
+      u.wallet_address,  
+      u.total_deposit,  
+      u.left_volume,  
+      u.right_volume,  
+      u.cycles,  
+  
+      IFNULL(w.balance,0) as wallet,  
+  
+      IFNULL(SUM(i.amount),0) as total_income  
+  
+    FROM Users u  
+    LEFT JOIN Wallets w ON u.id = w.user_id  
+    LEFT JOIN Income i ON u.id = i.user_id  
+  
+    GROUP BY u.id  
+    ORDER BY u.id DESC  
+  `);  
+  
+  res.json(rows);  
+});  
+  
+// ==========================================  
+// 👤 USER FULL DETAILS  
+// ==========================================  
+app.get("/api/admin/user/:memberId", async (req,res)=>{  
+  
+  const [u] = await pool.query(  
+    "SELECT * FROM Users WHERE member_id=?",  
+    [req.params.memberId]  
+  );  
+  
+  if(!u.length) return res.json({});  
+  
+  const user = u[0];  
+  
+  const [w] = await pool.query(  
+    "SELECT balance FROM Wallets WHERE user_id=?",  
+    [user.id]  
+  );  
+  
+  const [income] = await pool.query(`  
+    SELECT type, SUM(amount) as total  
+    FROM Income  
+    WHERE user_id=?  
+    GROUP BY type  
+  `,[user.id]);  
+  
+  const [dep] = await pool.query(  
+    "SELECT SUM(amount) as total FROM Deposits WHERE user_id=?",  
+    [user.id]  
+  );  
+  
+  const [wd] = await pool.query(  
+    "SELECT SUM(amount) as total FROM Withdrawals WHERE user_id=?",  
+    [user.id]  
+  );  
+  
+  res.json({  
+    profile: user,  
+    wallet: w[0]?.balance || 0,  
+    income,  
+    total_deposit: dep[0].total || 0,  
+    total_withdraw: wd[0].total || 0  
+  });  
+});  
+  
+// ==========================================  
+// 📅 DAILY DEPOSITS  
+// ==========================================  
+app.get("/api/admin/daily-deposits", async (req,res)=>{  
+  
+  const [rows] = await pool.query(`  
+    SELECT   
+      DATE(created_at) as date,  
+      SUM(amount) as total,  
+      COUNT(*) as count  
+    FROM Deposits  
+    GROUP BY DATE(created_at)  
+    ORDER BY date DESC  
+  `);  
+  
+  res.json(rows);  
+});  
+  
+// ==========================================  
+// 📅 DAILY WITHDRAW  
+// ==========================================  
+app.get("/api/admin/daily-withdraw", async (req,res)=>{  
+  
+  const [rows] = await pool.query(`  
+    SELECT   
+      DATE(created_at) as date,  
+      SUM(amount) as total,  
+      COUNT(*) as count  
+    FROM Withdrawals  
+    GROUP BY DATE(created_at)  
+    ORDER BY date DESC  
+  `);  
+  
+  res.json(rows);  
+});  
+  
+// ==========================================  
+// 📊 INCOME ANALYTICS  
+// ==========================================  
+app.get("/api/admin/income-analytics", async (req,res)=>{  
+  
+  const [rows] = await pool.query(`  
+    SELECT   
+      type,  
+      SUM(amount) as total  
+    FROM Income  
+    GROUP BY type  
+  `);  
+  
+  res.json(rows);  
+});  
+  
+// ==========================================  
+// 📈 USER GROWTH  
+// ==========================================  
+app.get("/api/admin/growth", async (req,res)=>{  
+  
+  const [rows] = await pool.query(`  
+    SELECT   
+      DATE(created_at) as date,  
+      COUNT(*) as users  
+    FROM Users  
+    GROUP BY DATE(created_at)  
+    ORDER BY date DESC  
+  `);  
+  
+  res.json(rows);  
+});  
+  
+// ==========================================  
+// 💰 ADD FUND  
+// ==========================================  
+app.post("/api/admin/add-fund", async (req,res)=>{  
+  
+  const { member_id, amount } = req.body;  
+  
+  const [u] = await pool.query(  
+    "SELECT id FROM Users WHERE member_id=?",  
+    [member_id]  
+  );  
+  
+  if(!u.length) return res.json({msg:"User not found"});  
+  
+  await wallet(u[0].id, amount, "CREDIT");  
+  
+  res.json({success:true});  
+});  
+  
+// ==========================================  
+// 🔎 DATE FILTER (ADVANCED)  
+// ==========================================  
+app.get("/api/admin/filter", async (req,res)=>{  
+  
+  const { from, to } = req.query;  
+  
+  const [dep] = await pool.query(`  
+    SELECT d.*, u.member_id  
+    FROM Deposits d  
+    JOIN Users u ON d.user_id = u.id  
+    WHERE DATE(d.created_at) BETWEEN ? AND ?  
+  `,[from,to]);  
+  
+  const [wd] = await pool.query(`  
+    SELECT w.*, u.member_id  
+    FROM Withdrawals w  
+    JOIN Users u ON w.user_id = u.id  
+    WHERE DATE(w.created_at) BETWEEN ? AND ?  
+  `,[from,to]);  
+  
+  res.json({  
+    deposits: dep,  
+    withdrawals: wd  
+  });  
+});  
+  
+// ==========================================    
+// 👤 USER - FULL DASHBOARD (FINAL SAFE)    
+// ==========================================    
+app.get("/api/user/full-dashboard/:memberId", async (req,res)=>{    
+    
+  try{    
+    
+    const memberId = req.params.memberId;    
+    
+    const [u] = await pool.query(    
+      "SELECT * FROM Users WHERE member_id=?",    
+      [memberId]    
+    );    
+    
+    if(!u.length) return res.json({});    
+    
+    const user = u[0];    
+    
+    // 💰 WALLET    
+    const [w] = await pool.query(    
+      "SELECT balance FROM Wallets WHERE user_id=?",    
+      [user.id]    
+    );    
+    
+    // 💸 INCOME SAFE    
+    const [income] = await pool.query(`    
+      SELECT     
+        SUM(CASE WHEN type='WORKING' THEN amount ELSE 0 END) as working,    
+        SUM(CASE WHEN type='DIRECT' THEN amount ELSE 0 END) as direct,    
+        SUM(CASE WHEN type='BINARY' THEN amount ELSE 0 END) as binary,    
+        SUM(amount) as total    
+      FROM Income WHERE user_id=?    
+    `,[user.id]);    
+    
+    const working = income[0]?.working || 0;    
+    const direct = income[0]?.direct || 0;    
+    const binary = income[0]?.binary || 0;    
+    const total = income[0]?.total || 0;    
+    
+    // 💰 DEPOSIT    
+    const [dep] = await pool.query(    
+      "SELECT SUM(amount) as total FROM Deposits WHERE user_id=?",    
+      [user.id]    
+    );    
+    
+    const totalDeposit = dep[0]?.total || 0;    
+    
+    // 👥 DIRECT TEAM    
+    const [directTeam] = await pool.query(    
+      "SELECT COUNT(*) as total FROM Users WHERE sponsor_id=?",    
+      [memberId]    
+    );    
+    
+    // 📊 TODAY TEAM VOLUME    
+    const [todayVol] = await pool.query(`    
+      SELECT SUM(d.amount) as total    
+      FROM Deposits d    
+      JOIN Users u ON d.user_id = u.id    
+      WHERE u.sponsor_id=? AND DATE(d.created_at)=CURDATE()    
+    `,[memberId]);    
+    
+    // 📊 FULL TEAM VOLUME (RECURSIVE)    
+    const [teamVol] = await pool.query(`    
+      WITH RECURSIVE downline AS (    
+        SELECT member_id FROM Users WHERE sponsor_id=?    
+    
+        UNION ALL    
+    
+        SELECT u.member_id     
+        FROM Users u    
+        INNER JOIN downline d ON u.sponsor_id = d.member_id    
+      )    
+      SELECT SUM(d.amount) as total    
+      FROM Deposits d    
+      JOIN Users u ON d.user_id = u.id    
+      WHERE u.member_id IN (SELECT member_id FROM downline)    
+    `,[memberId]);    
+    
+    // 🔗 REF LINKS    
+    const referral_left = `https://yourdomain.com/register?ref=${memberId}&pos=LEFT`;    
+    const referral_right = `https://yourdomain.com/register?ref=${memberId}&pos=RIGHT`;    
+    
+    res.json({    
+    
+      member_id: user.member_id,    
+      name: user.full_name,    
+    
+      referral_left,    
+      referral_right,    
+    
+      wallet: w[0]?.balance || 0,    
+      total_deposit: totalDeposit,    
+    
+      working_income: working,    
+      direct_income: direct,    
+      binary_income: binary,    
+      total_income: total,    
+    
+      direct_team: directTeam[0]?.total || 0,    
+      today_team_volume: todayVol[0]?.total || 0,    
+      total_team_volume: teamVol[0]?.total || 0,    
+    
+      left: user.left_volume || 0,    
+      right: user.right_volume || 0,    
+      cycles: user.cycles || 0    
+    
+    });    
+    
+  }catch(err){    
+    console.log(err);    
+    res.status(500).json({error:"Dashboard error"});    
+  }    
+    
+});    
+    
+    
+// ==========================================    
+// 🔥 WORKING PLAN VIEW (FINAL SAFE)    
+// ==========================================    
+app.get("/api/user/working-view/:memberId", async (req,res)=>{    
+    
+  try{    
+    
+    const [u] = await pool.query(    
+      "SELECT * FROM Users WHERE member_id=?",    
+      [req.params.memberId]    
+    );    
+    
+    if(!u.length) return res.json({});    
+    
+    const user = u[0];    
+    
+    const [w] = await pool.query(    
+      "SELECT balance FROM Wallets WHERE user_id=?",    
+      [user.id]    
+    );    
+    
+    const [income] = await pool.query(`    
+      SELECT     
+        SUM(CASE WHEN type='WORKING' THEN amount ELSE 0 END) as working,    
+        SUM(CASE WHEN type='DIRECT' THEN amount ELSE 0 END) as direct,    
+        SUM(CASE WHEN type='BINARY' THEN amount ELSE 0 END) as binary,    
+        SUM(amount) as total    
+      FROM Income WHERE user_id=?    
+    `,[user.id]);    
+    
+    const working = income[0]?.working || 0;    
+    const direct = income[0]?.direct || 0;    
+    const binary = income[0]?.binary || 0;    
+    const total = income[0]?.total || 0;    
+    
+    const deposit = user.total_deposit || 0;    
+    
+    const max_cycles = 3;    
+    const completed_cycles = user.cycles || 0;    
+    
+    const total_possible = deposit * max_cycles;    
+    const remaining_income = total_possible - working;    
+    
+    const left = user.left_volume || 0;    
+    const right = user.right_volume || 0;    
+    
+    const required = deposit;    
+    
+    const left_needed = Math.max(0, required - left);    
+    const right_needed = Math.max(0, required - right);    
+    
+    const left_percent = required > 0 ? Math.min(100, (left / required) * 100) : 0;    
+    const right_percent = required > 0 ? Math.min(100, (right / required) * 100) : 0;    
+    
+    res.json({    
+    
+      member_id: user.member_id,    
+      name: user.full_name,    
+    
+      wallet: w[0]?.balance || 0,    
+      deposit: deposit,    
+    
+      working_income: working,    
+      direct_income: direct,    
+      binary_income: binary,    
+      total_income: total,    
+    
+      plan: {    
+        per_cycle_income: deposit,    
+        max_cycles: max_cycles,    
+        completed_cycles: completed_cycles,    
+        remaining_cycles: max_cycles - completed_cycles,    
+        total_possible_income: total_possible,    
+        earned: working,    
+        remaining_income: remaining_income,    
+        next_match_income: deposit,    
+        next_cycle_status: (left >= required && right >= required) ? "READY" : "PENDING"    
+      },    
+    
+      binary: {    
+        left,    
+        right,    
+        required,    
+        left_needed,    
+        right_needed,    
+        left_percent,    
+        right_percent    
+      }    
+    
+    });    
+    
+  }catch(err){    
+    console.log(err);    
+    res.status(500).json({error:"Working view error"});    
+  }    
+    
+});    
+    
+    
+// ==========================================    
+// 🔥 PROGRESS SAFE    
+// ==========================================    
+app.get("/api/user/progress/:memberId", async (req,res)=>{    
+    
+  try{    
+    
+    const [u] = await pool.query(    
+      "SELECT total_deposit, left_volume, right_volume FROM Users WHERE member_id=?",    
+      [req.params.memberId]    
+    );    
+    
+    if(!u.length) return res.json({});    
+    
+    const user = u[0];    
+    
+    const required = user.total_deposit || 0;    
+    
+    res.json({    
+      left_percent: required > 0 ? (user.left_volume / required) * 100 : 0,    
+      right_percent: required > 0 ? (user.right_volume / required) * 100 : 0    
+    });    
+    
+  }catch(err){    
+    res.status(500).json({error:"Progress error"});    
+  }    
+    
+});    
+    
+// ==========================================    
+// 🌳 USER TREE (FINAL WITH LEVEL SUMMARY)    
+// ==========================================    
+app.get("/api/user/tree/:memberId", async (req,res)=>{    
+    
+  try{    
+    
+    const memberId = req.params.memberId;    
+    
+    const [rows] = await pool.query(`    
+      WITH RECURSIVE tree AS (    
+        SELECT member_id, full_name, sponsor_id, position, 1 as level    
+        FROM Users WHERE sponsor_id = ?    
+    
+        UNION ALL    
+    
+        SELECT u.member_id, u.full_name, u.sponsor_id, u.position, t.level + 1    
+        FROM Users u    
+        INNER JOIN tree t ON u.sponsor_id = t.member_id    
+      )    
+      SELECT * FROM tree ORDER BY level ASC    
+    `,[memberId]);    
+    
+    // 🔥 LEVEL SUMMARY    
+    const levels = {};    
+    rows.forEach(r=>{    
+      levels[r.level] = (levels[r.level] || 0) + 1;    
+    });    
+    
+    res.json({    
+      total_members: rows.length,    
+      level_summary: levels,    
+      members: rows    
+    });    
+    
+  }catch(err){    
+    console.log(err);    
+    res.status(500).json({error:"Tree error"});    
+  }    
+    
+});    
+    
+    
+// ==========================================    
+// 💸 USER FULL INCOME LIST (DETAIL SAFE)    
+// ==========================================    
+app.get("/api/user/income-list/:memberId", async (req,res)=>{    
+    
+  try{    
+    
+    const [u] = await pool.query(    
+      "SELECT id FROM Users WHERE member_id=?",    
+      [req.params.memberId]    
+    );    
+    
+    if(!u.length) return res.json([]);    
+    
+    const userId = u[0].id;    
+    
+    const [rows] = await pool.query(`    
+      SELECT     
+        type,    
+        amount,    
+        DATE(created_at) as date,    
+        TIME(created_at) as time    
+      FROM Income    
+      WHERE user_id=?    
+      ORDER BY created_at DESC    
+    `,[userId]);    
+    
+    res.json(rows);    
+    
+  }catch(err){    
+    res.status(500).json({error:"Income list error"});    
+  }    
+    
+});    
+    
+    
+// ==========================================    
+// 🔁 WORKING PLAN HISTORY (SAFE)    
+// ==========================================    
+app.get("/api/user/working-history/:memberId", async (req,res)=>{    
+    
+  try{    
+    
+    const [u] = await pool.query(    
+      "SELECT id FROM Users WHERE member_id=?",    
+      [req.params.memberId]    
+    );    
+    
+    if(!u.length) return res.json([]);    
+    
+    const userId = u[0].id;    
+    
+    const [rows] = await pool.query(`    
+      SELECT     
+        amount,    
+        DATE(created_at) as date    
+      FROM Income    
+      WHERE user_id=? AND type='WORKING'    
+      ORDER BY created_at DESC    
+    `,[userId]);    
+    
+    res.json(rows);    
+    
+  }catch(err){    
+    res.status(500).json({error:"Working history error"});    
+  }    
+    
+});    
+    
+    
+// ==========================================    
+// 🔗 BINARY MATCH HISTORY (SAFE)    
+// ==========================================    
+app.get("/api/user/binary-history/:memberId", async (req,res)=>{    
+    
+  try{    
+    
+    const [u] = await pool.query(    
+      "SELECT id FROM Users WHERE member_id=?",    
+      [req.params.memberId]    
+    );    
+    
+    if(!u.length) return res.json([]);    
+    
+    const userId = u[0].id;    
+    
+    const [rows] = await pool.query(`    
+      SELECT     
+        amount,    
+        DATE(created_at) as date    
+      FROM Income    
+      WHERE user_id=? AND type='BINARY'    
+      ORDER BY created_at DESC    
+    `,[userId]);    
+    
+    res.json(rows);    
+    
+  }catch(err){    
+    res.status(500).json({error:"Binary history error"});    
+  }    
+    
+});    
+    
+// ==========================================    
+// 💰 USER DEPOSIT HISTORY (FULL)    
+// ==========================================    
+app.get("/api/user/deposit-history/:memberId", async (req,res)=>{    
+    
+  try{    
+    
+    const [u] = await pool.query(    
+      "SELECT id FROM Users WHERE member_id=?",    
+      [req.params.memberId]    
+    );    
+    
+    if(!u.length) return res.json([]);    
+    
+    const userId = u[0].id;    
+    
+    const [rows] = await pool.query(`    
+      SELECT     
+        amount,    
+        status,    
+        network,    
+        tx_hash,    
+        DATE(created_at) as date,    
+        TIME(created_at) as time    
+      FROM Deposits    
+      WHERE user_id=?    
+      ORDER BY created_at DESC    
+    `,[userId]);    
+    
+    res.json(rows);    
+    
+  }catch(err){    
+    res.status(500).json({error:"Deposit history error"});    
+  }    
+    
+});    
+    
+// ==========================================    
+// 💸 USER WITHDRAW HISTORY (FULL)    
+// ==========================================    
+app.get("/api/user/withdraw-history/:memberId", async (req,res)=>{    
+    
+  try{    
+    
+    const [u] = await pool.query(    
+      "SELECT id FROM Users WHERE member_id=?",    
+      [req.params.memberId]    
+    );    
+    
+    if(!u.length) return res.json([]);    
+    
+    const userId = u[0].id;    
+    
+    const [rows] = await pool.query(`    
+      SELECT     
+        amount,    
+        status,    
+        network,    
+        tx_hash,    
+        DATE(created_at) as date,    
+        TIME(created_at) as time    
+      FROM Withdrawals    
+      WHERE user_id=?    
+      ORDER BY created_at DESC    
+    `,[userId]);    
+    
+    res.json(rows);    
+    
+  }catch(err){    
+    res.status(500).json({error:"Withdraw history error"});    
+  }    
+    
+});  
+  
+// ==========================================  
+app.listen(3000, ()=>console.log("🔥 FINAL WORKING PLAN SERVER RUNNING"));
