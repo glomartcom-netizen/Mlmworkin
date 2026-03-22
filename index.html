@@ -24,6 +24,52 @@ const pool = mysql.createPool({
 const MAX_CYCLES = 3;  
 const DIRECT_PERCENT = 0.05;  
 const BINARY_PERCENT = 0.05;  
+
+// ==========================================
+// 📧 EMAIL SETUP
+// ==========================================
+const nodemailer = require("nodemailer");
+
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS
+  }
+});
+
+// ==========================================
+// 📧 SEND WELCOME EMAIL
+// ==========================================
+async function sendWelcomeEmail(email, member_id, name){
+
+  const html = `
+    <div style="font-family:Arial;padding:20px">
+      <h2>🎉 Welcome to DMX, ${name}</h2>
+
+      <p>Your account has been successfully created.</p>
+
+      <h3>🔐 Your Login Details:</h3>
+      <p><b>Member ID:</b> ${member_id}</p>
+
+      <p>Start your earning journey now 🚀</p>
+
+      <hr/>
+      <p style="color:gray;">DMX Team</p>
+    </div>
+  `;
+
+  try{
+    await transporter.sendMail({
+      from: process.env.EMAIL_USER,
+      to: email,
+      subject: "Welcome to DMX 🚀",
+      html
+    });
+  }catch(err){
+    console.log("Email error:", err);
+  }
+}
   
 // ==========================================  
 // 🔥 CRYPTO SETUP  
@@ -48,24 +94,55 @@ const tronWeb = new TronWeb({
   privateKey: process.env.TRON_PRIVATE_KEY  
 });  
   
-// ==========================================  
-// 💰 WALLET FUNCTION  
-// ==========================================  
-async function wallet(userId, amount, type){  
-  
-  if(type==="CREDIT"){  
-    await pool.query(  
-      "UPDATE Wallets SET balance = balance + ? WHERE user_id=?",  
-      [amount, userId]  
-    );  
-  }else{  
-    const [r] = await pool.query(  
-      "UPDATE Wallets SET balance = balance - ? WHERE user_id=? AND balance>=?",  
-      [amount, userId, amount]  
-    );  
-    if(r.affectedRows === 0) throw new Error("Insufficient balance");  
-  }  
-}  
+// ==========================================
+// 💰 WALLET FUNCTION (FINAL SAFE)
+// ==========================================
+async function wallet(userId, amount, type, remark = ""){
+
+  const conn = await pool.getConnection();
+
+  try{
+
+    await conn.beginTransaction();
+
+    if(type === "CREDIT"){
+
+      await conn.query(
+        "UPDATE Wallets SET balance = balance + ? WHERE user_id=?",
+        [amount, userId]
+      );
+
+    }else{
+
+      const [r] = await conn.query(
+        "UPDATE Wallets SET balance = balance - ? WHERE user_id=? AND balance>=?",
+        [amount, userId, amount]
+      );
+
+      if(r.affectedRows === 0){
+        throw new Error("Insufficient balance");
+      }
+    }
+
+    // 🔥 WALLET LOG (IMPORTANT)
+    await conn.query(`
+      INSERT INTO Wallet_Logs (user_id, amount, type, remark)
+      VALUES (?, ?, ?, ?)
+    `,[userId, amount, type, remark]);
+
+    await conn.commit();
+
+  }catch(err){
+
+    await conn.rollback();
+    throw err;
+
+  }finally{
+
+    conn.release();
+
+  }
+}
   
 // ==========================================  
 // 🔥 VERIFY TRANSACTION  
@@ -100,32 +177,46 @@ async function verifyTransaction(tx_hash, network, amount){
   
   return false;  
 }  
-  
+
+
 // ==========================================  
-// 👤 REGISTER  
-// ==========================================  
-app.post("/api/register", async (req,res)=>{  
-  
-  const { name, mobile, sponsor, position, wallet_address } = req.body;  
-  
-  const member_id = "DMX" + Math.floor(100000 + Math.random()*900000);  
-  
-  const [r] = await pool.query(  
-    "INSERT INTO Users (member_id, full_name, mobile, sponsor_id, position, wallet_address, cycles) VALUES (?,?,?,?,?,?,0)",  
-    [member_id, name, mobile, sponsor, position, wallet_address]  
-  );  
-  
-  await pool.query(  
-    "INSERT INTO Wallets (user_id, balance) VALUES (?,0)",  
-    [r.insertId]  
-  );  
-  
-  res.json({  
-    member_id,  
-    referral_left: `?ref=${member_id}&pos=LEFT`,  
-    referral_right: `?ref=${member_id}&pos=RIGHT`  
-  });  
-});  
+// 🔥 REGISTER  
+// ==========================================
+app.post("/api/register", async (req,res)=>{
+
+  try{
+
+    const { name, mobile, email, sponsor, position, wallet_address } = req.body;
+
+    const member_id = "DMX" + Math.floor(100000 + Math.random()*900000);
+
+    const [r] = await pool.query(
+      "INSERT INTO Users (member_id, full_name, mobile, email, sponsor_id, position, wallet_address, cycles) VALUES (?,?,?,?,?,?,?,0)",
+      [member_id, name, mobile, email, sponsor, position, wallet_address]
+    );
+
+    await pool.query(
+      "INSERT INTO Wallets (user_id, balance) VALUES (?,0)",
+      [r.insertId]
+    );
+
+    // 🔥 EMAIL SEND HERE
+    if(email){
+      await sendWelcomeEmail(email, member_id, name);
+    }
+
+    res.json({
+      member_id,
+      referral_left: `?ref=${member_id}&pos=LEFT`,
+      referral_right: `?ref=${member_id}&pos=RIGHT`
+    });
+
+  }catch(err){
+    console.log(err);
+    res.status(500).json({error:"Register failed"});
+  }
+
+});
   
 // ==========================================  
 // 🔥 CRYPTO DEPOSIT (AUTO)  
@@ -187,24 +278,38 @@ app.post("/api/user/deposit-crypto", async (req,res)=>{
 // ==========================================  
 // 🔥 BINARY UPDATE  
 // ==========================================  
-async function updateBinary(member_id, amount, position){  
-  
-  if(!member_id) return;  
-  
-  if(position==="LEFT"){  
-    await pool.query(  
-      "UPDATE Users SET left_volume = left_volume + ? WHERE member_id=?",  
-      [amount, member_id]  
-    );  
-  }else{  
-    await pool.query(  
-      "UPDATE Users SET right_volume = right_volume + ? WHERE member_id=?",  
-      [amount, member_id]  
-    );  
-  }  
-  
-  await checkMatching(member_id);  
-}  
+async function updateBinary(member_id, amount, position){
+
+  let current = member_id;
+  let pos = position;
+
+  while(current){
+
+    const [u] = await pool.query(
+      "SELECT member_id, sponsor_id, position FROM Users WHERE member_id=?",
+      [current]
+    );
+
+    if(!u.length) break;
+
+    if(pos === "LEFT"){
+      await pool.query(
+        "UPDATE Users SET left_volume = left_volume + ? WHERE member_id=?",
+        [amount, current]
+      );
+    }else{
+      await pool.query(
+        "UPDATE Users SET right_volume = right_volume + ? WHERE member_id=?",
+        [amount, current]
+      );
+    }
+
+    await checkMatching(current);
+
+    pos = u[0].position;
+    current = u[0].sponsor_id;
+  }
+}
   
 // ==========================================  
 // 🔥 WORKING PLAN + BINARY MATCH  
@@ -224,23 +329,24 @@ async function checkMatching(member_id){
   
   if(user.left_volume >= required && user.right_volume >= required){  
   
-    // 🔥 WORKING INCOME  
-    await wallet(user.id, user.total_deposit, "CREDIT");  
-  
-    await pool.query(  
-      "INSERT INTO Income (user_id,type,amount) VALUES (?, 'WORKING', ?)",  
-      [user.id, user.total_deposit]  
-    );  
-  
-    // 🔥 BINARY BONUS  
-    const binary = user.total_deposit * BINARY_PERCENT;  
-  
-    await wallet(user.id, binary, "CREDIT");  
-  
-    await pool.query(  
-      "INSERT INTO Income (user_id,type,amount) VALUES (?, 'BINARY', ?)",  
-      [user.id, binary]  
-    );  
+    // 🔥 WORKING INCOME
+await wallet(user.id, user.total_deposit, "CREDIT", "Working Income");
+
+await pool.query(
+  "INSERT INTO Income (user_id,type,amount) VALUES (?, 'WORKING', ?)",
+  [user.id, user.total_deposit]
+);
+
+// 🔥 BINARY BONUS
+const matchAmount = Math.min(user.left_volume, user.right_volume);
+const binary = matchAmount * BINARY_PERCENT;
+
+await wallet(user.id, binary, "CREDIT", "Binary Income");
+
+await pool.query(
+  "INSERT INTO Income (user_id,type,amount) VALUES (?, 'BINARY', ?)",
+  [user.id, binary]
+);
   
     // cycle  
     await pool.query(  
@@ -256,66 +362,131 @@ async function checkMatching(member_id){
   }  
 }  
   
-// ==========================================  
-// 💸 WITHDRAW (AUTO CRYPTO)  
-// ==========================================  
-app.post("/api/user/withdraw", async (req,res)=>{  
-  
-  const { member_id, amount, wallet_address, network } = req.body;  
-  
-  const [u] = await pool.query(  
-    "SELECT id FROM Users WHERE member_id=?",  
-    [member_id]  
-  );  
-  
-  const userId = u[0].id;  
-  
-  const [w] = await pool.query(  
-    "SELECT balance FROM Wallets WHERE user_id=?",  
-    [userId]  
-  );  
-  
-  if(!w.length || w[0].balance < amount){  
-    return res.json({msg:"Insufficient balance"});  
-  }  
-  
-  await wallet(userId, amount, "DEBIT");  
-  
-  let txHash = "";  
-  
-  try{  
-  
-    if(network === "BEP20"){  
-      const tx = await BEP20.transfer(  
-        wallet_address,  
-        ethers.parseUnits(amount.toString(), 18)  
-      );  
-      txHash = tx.hash;  
-    }  
-  
-    if(network === "TRC20"){  
-      const contract = await tronWeb.contract().at("TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj");  
-  
-      const tx = await contract.transfer(  
-        wallet_address,  
-        amount * 1e6  
-      ).send();  
-  
-      txHash = tx;  
-    }  
-  
-  }catch(e){  
-    await wallet(userId, amount, "CREDIT");  
-    return res.json({msg:"Withdraw failed"});  
-  }  
-  
-  await pool.query(  
-    "INSERT INTO Withdrawals (user_id, amount, tx_hash, network, status) VALUES (?, ?, ?, ?, 'PAID')",  
-    [userId, amount, txHash, network]  
-  );  
-  
-  res.json({success:true, txHash});  
-});  
+// ==========================================
+// 💸 WITHDRAW (FINAL FIXED BEP20 + TRC20)
+// ==========================================
+app.post("/api/user/withdraw", async (req,res)=>{
+
+  try{
+
+    const { member_id, amount, wallet_address, network } = req.body;
+
+    if(!member_id || !amount || !wallet_address || !network){
+      return res.json({msg:"Missing data"});
+    }
+
+    if(amount <= 0){
+      return res.json({msg:"Invalid amount"});
+    }
+
+    // 🔍 USER
+    const [u] = await pool.query(
+      "SELECT id FROM Users WHERE member_id=?",
+      [member_id]
+    );
+
+    if(!u.length){
+      return res.json({msg:"User not found"});
+    }
+
+    const userId = u[0].id;
+
+    // 💰 BALANCE CHECK
+    const [w] = await pool.query(
+      "SELECT balance FROM Wallets WHERE user_id=?",
+      [userId]
+    );
+
+    if(!w.length || w[0].balance < amount){
+      return res.json({msg:"Insufficient balance"});
+    }
+
+    // 🔻 DEBIT
+    await wallet(userId, amount, "DEBIT", `Withdraw (${network})`);
+
+    let txHash = "";
+
+    try{
+
+      // =========================
+      // 🔥 BEP20 (FIXED)
+      // =========================
+      if(network === "BEP20"){
+
+        // 🔥 GAS CHECK (BNB)
+        const balance = await bscProvider.getBalance(bscWallet.address);
+
+        if(balance <= 0n){
+          throw new Error("No BNB gas");
+        }
+
+        const tx = await BEP20.transfer(
+          wallet_address,
+          ethers.parseUnits(amount.toString(), 18)
+        );
+
+        console.log("BEP20 TX:", tx);
+
+        txHash = tx.hash;
+      }
+
+      // =========================
+      // 🔥 TRC20
+      // =========================
+      else if(network === "TRC20"){
+
+        const contract = await tronWeb.contract().at(
+          "TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj"
+        );
+
+        const tx = await contract.transfer(
+          wallet_address,
+          amount * 1e6
+        ).send();
+
+        console.log("TRC20 TX:", tx);
+
+        txHash = tx;
+      }
+
+      else{
+        throw new Error("Invalid network");
+      }
+
+    }catch(e){
+
+      console.log("WITHDRAW ERROR:", e);
+
+      // 🔄 REFUND
+      await wallet(userId, amount, "CREDIT", "Withdraw Failed Refund");
+
+      return res.json({
+        msg:"Withdraw failed",
+        error:e.message
+      });
+    }
+
+    // 💾 SAVE SUCCESS
+    await pool.query(
+      "INSERT INTO Withdrawals (user_id, amount, tx_hash, network, status) VALUES (?, ?, ?, ?, 'PAID')",
+      [userId, amount, txHash, network]
+    );
+
+    res.json({
+      success:true,
+      txHash
+    });
+
+  }catch(err){
+
+    console.log(err);
+
+    res.status(500).json({
+      error:"Withdraw error"
+    });
+  }
+
+});
   
 // ==========================================  
 // 📊 ADMIN - MAIN STATS  
@@ -621,12 +792,22 @@ app.get("/api/user/full-dashboard/:memberId", async (req,res)=>{
     );    
     
     // 📊 TODAY TEAM VOLUME    
-    const [todayVol] = await pool.query(`    
-      SELECT SUM(d.amount) as total    
-      FROM Deposits d    
-      JOIN Users u ON d.user_id = u.id    
-      WHERE u.sponsor_id=? AND DATE(d.created_at)=CURDATE()    
-    `,[memberId]);    
+    const [todayVol] = await pool.query(`
+  WITH RECURSIVE downline AS (
+    SELECT member_id FROM Users WHERE sponsor_id=?
+
+    UNION ALL
+
+    SELECT u.member_id 
+    FROM Users u
+    INNER JOIN downline d ON u.sponsor_id = d.member_id
+  )
+  SELECT SUM(d.amount) as total
+  FROM Deposits d
+  JOIN Users u ON d.user_id = u.id
+  WHERE u.member_id IN (SELECT member_id FROM downline)
+  AND DATE(d.created_at)=CURDATE()
+`,[memberId]);
     
     // 📊 FULL TEAM VOLUME (RECURSIVE)    
     const [teamVol] = await pool.query(`    
